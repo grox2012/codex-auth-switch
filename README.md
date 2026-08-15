@@ -76,8 +76,29 @@ so Codex stays launchable.
 
 `--tokenfactory` never writes a dangling provider reference. It creates a
 complete `[model_providers.tokenfactory]` definition when one is missing, then
-selects it. Override the default endpoint with `--tokenfactory-url` or
-`TOKENFACTORY_BASE_URL`.
+selects it. Before changing `config.toml`, it checks the gateway's `/healthz`
+endpoint; an unreachable gateway leaves the current Codex provider unchanged.
+Use `--skip-tokenfactory-health-check` only when intentionally preparing an
+offline gateway.
+
+If `.codex/models_cache.json` contains a valid Codex model catalog, the switcher
+also references it through `model_catalog_json`. This keeps current Codex builds
+quiet when an older TokenFactory release returns only the OpenAI-style
+`/v1/models` shape. A user-supplied catalog setting is preserved; the managed
+fallback is removed when switching back to OpenAI or running `--reset`.
+
+Override the endpoint with `--tokenfactory-url` or `TOKENFACTORY_BASE_URL`.
+An explicit URL updates an existing provider definition instead of silently
+keeping a stale address. Without an override, the switcher preserves an
+existing TokenFactory URL and otherwise defaults to `http://127.0.0.1:8080/v1`.
+
+For a gateway exposed to a Windows machine through Tailscale Serve:
+
+```powershell
+$url = 'https://gateway.example.ts.net:8443/v1'
+[Environment]::SetEnvironmentVariable('TOKENFACTORY_BASE_URL', $url, 'User')
+codex-auth-switch --tokenfactory --tokenfactory-url $url
+```
 
 ## Security
 

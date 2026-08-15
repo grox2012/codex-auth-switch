@@ -9,13 +9,17 @@ import sys
 import tempfile
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from codex_auth_switch import __version__
 from codex_auth_switch.codex_config import (
     DEFAULT_CODEX_CONFIG_PATH,
     reset_codex_config,
+    resolve_tokenfactory_base_url,
     set_codex_model_provider,
 )
 from codex_auth_switch.config import (
@@ -64,7 +68,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--tokenfactory-url",
-        default=os.environ.get("TOKENFACTORY_BASE_URL", "http://127.0.0.1:8080/v1"),
+        default=os.environ.get("TOKENFACTORY_BASE_URL"),
+        help=(
+            "TokenFactory API base ending in /v1. Defaults to TOKENFACTORY_BASE_URL, "
+            "then the existing provider URL, then http://127.0.0.1:8080/v1."
+        ),
+    )
+    parser.add_argument(
+        "--tokenfactory-health-timeout",
+        type=float,
+        default=5.0,
+        help="Seconds to wait for the TokenFactory health check (default: 5).",
+    )
+    parser.add_argument(
+        "--skip-tokenfactory-health-check",
+        action="store_true",
+        help="Write the provider config without checking TokenFactory /healthz.",
     )
     operation = parser.add_mutually_exclusive_group()
     operation.add_argument("--single", nargs="?", const="recommended", metavar="SOURCE_ID")
@@ -77,7 +96,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset:
         return _reset(codex_config_path)
     if args.tokenfactory:
-        return _set_provider(codex_config_path, "tokenfactory", args.tokenfactory_url)
+        return _set_provider(
+            codex_config_path,
+            "tokenfactory",
+            args.tokenfactory_url,
+            check_health=not args.skip_tokenfactory_health_check,
+            health_timeout=args.tokenfactory_health_timeout,
+        )
 
     if args.single:
         try:
@@ -126,18 +151,52 @@ def _reset(config_path: Path) -> int:
     return 0
 
 
-def _set_provider(config_path: Path, provider: str, tokenfactory_url: str) -> int:
+def _set_provider(
+    config_path: Path,
+    provider: str,
+    tokenfactory_url: str | None,
+    *,
+    check_health: bool,
+    health_timeout: float,
+) -> int:
     try:
+        effective_url = resolve_tokenfactory_base_url(config_path, tokenfactory_url)
+        if check_health:
+            _check_tokenfactory_health(effective_url, timeout=health_timeout)
         set_codex_model_provider(
             config_path,
             provider,
-            tokenfactory_url=tokenfactory_url,
+            tokenfactory_url=effective_url,
         )
-    except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, ValueError, RuntimeError) as exc:
         print(f"provider switch failed: {exc}", file=sys.stderr)
         return 1
     print(f"Default provider: {provider}")
+    print(f"TokenFactory API: {effective_url}")
     return 0
+
+
+def _check_tokenfactory_health(base_url: str, *, timeout: float) -> None:
+    if timeout <= 0:
+        raise ValueError("TokenFactory health timeout must be greater than zero")
+    parsed = urlsplit(base_url)
+    api_path = parsed.path.rstrip("/")
+    health_path = f"{api_path[:-3]}/healthz" if api_path.endswith("/v1") else "/healthz"
+    health_url = urlunsplit((parsed.scheme, parsed.netloc, health_path, "", ""))
+    request = urllib.request.Request(
+        health_url,
+        headers={"Accept": "application/json", "User-Agent": "codex-auth-switch"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise RuntimeError(
+                    f"TokenFactory health check returned HTTP {response.status}: {health_url}"
+                )
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"TokenFactory is unreachable at {health_url}; Codex config was not changed: {exc}"
+        ) from exc
 
 
 def _switch_account(
@@ -304,8 +363,7 @@ def _print_status(
     for result in results:
         status = "available" if result.available else "unavailable"
         print(
-            f"{result.source.source_id:<24} {status:<11} "
-            f"{result.elapsed_ms:>6}ms  {result.message}"
+            f"{result.source.source_id:<24} {status:<11} {result.elapsed_ms:>6}ms  {result.message}"
         )
 
 
@@ -365,7 +423,9 @@ def _doctor(argv: list[str]) -> int:
 
 
 def _codex_home(source_id: str) -> Path:
-    safe_id = "".join(character if character.isalnum() or character in "-_" else "_" for character in source_id)
+    safe_id = "".join(
+        character if character.isalnum() or character in "-_" else "_" for character in source_id
+    )
     if os.name == "nt":
         root = Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()))
         return root / "CodexAuthSwitch" / "codex-home" / safe_id

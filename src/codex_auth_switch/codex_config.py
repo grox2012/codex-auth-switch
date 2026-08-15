@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -17,8 +18,10 @@ TOKENFACTORY_PROVIDER_DEFAULTS = {
 }
 
 _TOP_LEVEL_MODEL_PROVIDER = re.compile(r"^\s*model_provider\s*=")
+_TOP_LEVEL_MODEL_CATALOG = re.compile(r"^\s*model_catalog_json\s*=")
 _TABLE_HEADER = re.compile(r"^\s*\[\s*([^\]]+)\s*\]\s*(?:#.*)?$")
 _SIMPLE_KEY = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
+_MANAGED_MODEL_CATALOG_COMMENT = "# Managed by codex-auth-switch for TokenFactory."
 
 
 @dataclass(frozen=True)
@@ -32,7 +35,7 @@ def set_codex_model_provider(
     config_path: Path,
     provider: str,
     *,
-    tokenfactory_url: str = TOKENFACTORY_PROVIDER_DEFAULTS["base_url"],
+    tokenfactory_url: str | None = None,
 ) -> None:
     if not provider or any(character.isspace() for character in provider):
         raise ValueError("model provider must be a non-empty identifier")
@@ -41,7 +44,15 @@ def set_codex_model_provider(
     original, mode = _read_config(path)
     updated = original
     if provider == TOKENFACTORY_PROVIDER_ID:
-        updated = _ensure_tokenfactory_provider(updated, tokenfactory_url)
+        effective_url = _resolve_tokenfactory_base_url(original, tokenfactory_url)
+        updated = _ensure_tokenfactory_provider(
+            updated,
+            effective_url,
+            replace_base_url=tokenfactory_url is not None,
+        )
+        updated = _ensure_model_catalog_fallback(updated, path)
+    else:
+        updated = _remove_managed_model_catalog(updated)
     updated = _replace_top_level_model_provider(updated, provider)
     payload = tomllib.loads(updated)
     if provider == TOKENFACTORY_PROVIDER_ID:
@@ -53,6 +64,16 @@ def set_codex_model_provider(
     _atomic_write(path, updated, mode)
 
 
+def resolve_tokenfactory_base_url(
+    config_path: Path,
+    override: str | None = None,
+) -> str:
+    """Resolve the URL a TokenFactory switch would use without changing config."""
+
+    original, _ = _read_config(config_path.expanduser())
+    return _resolve_tokenfactory_base_url(original, override)
+
+
 def reset_codex_config(config_path: Path) -> ResetResult:
     """Remove only settings managed by this tool; never invoke an external command."""
 
@@ -62,6 +83,7 @@ def reset_codex_config(config_path: Path) -> ResetResult:
 
     original, mode = _read_config(path)
     updated = _remove_top_level_model_provider(original)
+    updated = _remove_managed_model_catalog(updated)
     updated = _remove_tokenfactory_provider_tables(updated)
     updated = _normalize_blank_lines(updated)
     tomllib.loads(updated)
@@ -123,7 +145,12 @@ def _remove_top_level_model_provider(original: str) -> str:
     return "".join(updated_lines)
 
 
-def _ensure_tokenfactory_provider(original: str, base_url: str) -> str:
+def _ensure_tokenfactory_provider(
+    original: str,
+    base_url: str,
+    *,
+    replace_base_url: bool,
+) -> str:
     lines = original.splitlines(keepends=True)
     table_index = None
     table_end = len(lines)
@@ -140,34 +167,140 @@ def _ensure_tokenfactory_provider(original: str, base_url: str) -> str:
             break
 
     defaults = {**TOKENFACTORY_PROVIDER_DEFAULTS, "base_url": base_url}
+    newline = _newline_for(original)
     if table_index is None:
         updated = original
         if updated and not updated.endswith(("\n", "\r")):
-            updated += "\n"
-        if updated and not updated.endswith("\n\n"):
-            updated += "\n"
+            updated += newline
+        if updated and not updated.endswith(newline * 2):
+            updated += newline
         updated += (
-            "# Managed by codex-auth-switch.\n"
-            "[model_providers.tokenfactory]\n"
-            f'name = "{defaults["name"]}"\n'
-            f'base_url = "{defaults["base_url"]}"\n'
-            f'wire_api = "{defaults["wire_api"]}"\n'
+            f"# Managed by codex-auth-switch.{newline}"
+            f"[model_providers.tokenfactory]{newline}"
+            f"name = {_toml_string(defaults['name'])}{newline}"
+            f"base_url = {_toml_string(defaults['base_url'])}{newline}"
+            f"wire_api = {_toml_string(defaults['wire_api'])}{newline}"
         )
         return updated
 
     existing_keys: set[str] = set()
-    for line in lines[table_index + 1 : table_end]:
+    for index in range(table_index + 1, table_end):
+        line = lines[index]
         match = _SIMPLE_KEY.match(line)
         if match:
-            existing_keys.add(match.group(1))
+            key = match.group(1)
+            existing_keys.add(key)
+            if key == "base_url" and replace_base_url:
+                line_ending = "\r\n" if line.endswith("\r\n") else "\n"
+                lines[index] = f"base_url = {_toml_string(base_url)}{line_ending}"
     missing = [
-        f'{key} = "{value}"\n'
+        f"{key} = {_toml_string(value)}{newline}"
         for key, value in defaults.items()
         if key not in existing_keys
     ]
     if missing:
         lines[table_end:table_end] = missing
     return "".join(lines)
+
+
+def _resolve_tokenfactory_base_url(original: str, override: str | None) -> str:
+    if override is not None:
+        return _normalize_tokenfactory_url(override)
+    if original:
+        payload = tomllib.loads(original)
+        providers = payload.get("model_providers")
+        if isinstance(providers, dict):
+            provider = providers.get(TOKENFACTORY_PROVIDER_ID)
+            if isinstance(provider, dict) and isinstance(provider.get("base_url"), str):
+                return _normalize_tokenfactory_url(provider["base_url"])
+    return TOKENFACTORY_PROVIDER_DEFAULTS["base_url"]
+
+
+def _ensure_model_catalog_fallback(original: str, config_path: Path) -> str:
+    """Use Codex's own cache when an older gateway cannot serve its catalog shape."""
+
+    lines = original.splitlines(keepends=True)
+    in_top_level = True
+    for line in lines:
+        if line.lstrip().startswith("["):
+            in_top_level = False
+        if in_top_level and _TOP_LEVEL_MODEL_CATALOG.match(line):
+            return original
+
+    catalog_path = config_path.parent / "models_cache.json"
+    if not _is_valid_model_catalog(catalog_path):
+        return original
+
+    newline = _newline_for(original)
+    insertion = [
+        f"{_MANAGED_MODEL_CATALOG_COMMENT}{newline}",
+        f"model_catalog_json = {_toml_string(str(catalog_path))}{newline}",
+    ]
+    table_index = next(
+        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
+        len(lines),
+    )
+    if table_index and lines[table_index - 1].strip():
+        insertion.append(newline)
+    lines[table_index:table_index] = insertion
+    return "".join(lines)
+
+
+def _is_valid_model_catalog(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("models"), list)
+        and bool(payload["models"])
+    )
+
+
+def _remove_managed_model_catalog(original: str) -> str:
+    lines = original.splitlines(keepends=True)
+    updated: list[str] = []
+    index = 0
+    while index < len(lines):
+        if lines[index].strip() == _MANAGED_MODEL_CATALOG_COMMENT:
+            index += 1
+            if index < len(lines) and _TOP_LEVEL_MODEL_CATALOG.match(lines[index]):
+                index += 1
+            continue
+        updated.append(lines[index])
+        index += 1
+    return "".join(updated)
+
+
+def _normalize_tokenfactory_url(value: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+
+    value = value.strip().rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or not parsed.path.endswith("/v1")
+    ):
+        raise ValueError(
+            "TokenFactory URL must be an http(s) API base ending in /v1 "
+            "without credentials, query parameters, or a fragment"
+        )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+def _toml_string(value: str) -> str:
+    # JSON strings use the same escapes needed by TOML basic strings for these values.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _newline_for(value: str) -> str:
+    return "\r\n" if "\r\n" in value else "\n"
 
 
 def _remove_tokenfactory_provider_tables(original: str) -> str:
