@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,15 @@ from codex_auth_switch.config import (
 )
 
 PROBE_PROMPT = "Return exactly: CODEX_AUTH_SWITCH_OK"
+FILE_CREDENTIALS_OVERRIDE = 'cli_auth_credentials_store="file"'
+AUTH_ENVIRONMENT_VARIABLES = (
+    "CODEX_ACCESS_TOKEN",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_FEDERATION_RULE_ID",
+    "OPENAI_IDENTITY_TOKEN_FILE",
+)
 
 
 @dataclass(frozen=True)
@@ -50,12 +60,15 @@ def main(argv: list[str] | None = None) -> int:
         return _doctor(argv[1:])
     if argv and argv[0] == "status":
         argv = argv[1:]
+    if argv and argv[0] == "launch":
+        return _launch(argv[1:])
 
     parser = argparse.ArgumentParser(
         description="Safely switch local Codex accounts and repair provider configuration.",
         epilog=(
             "Recovery: codex-auth-switch --reset\n"
-            "Single account: codex-auth-switch --single SOURCE_ID\n"
+            "Reset shared OAuth: codex-auth-switch --single SOURCE_ID\n"
+            "Launch isolated OAuth: codex-auth-switch launch SOURCE_ID\n"
             "TokenFactory: codex-auth-switch --tokenfactory"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -86,8 +99,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Write the provider config without checking TokenFactory /healthz.",
     )
     operation = parser.add_mutually_exclusive_group()
-    operation.add_argument("--single", nargs="?", const="recommended", metavar="SOURCE_ID")
-    operation.add_argument("--switch", nargs="?", const="recommended", metavar="SOURCE_ID")
+    operation.add_argument(
+        "--single",
+        nargs="?",
+        const="recommended",
+        metavar="SOURCE_ID",
+        help=(
+            "Reset TokenFactory config and clear the shared login so the next plain codex "
+            "run starts ChatGPT OAuth."
+        ),
+    )
+    operation.add_argument(
+        "--switch",
+        nargs="?",
+        const="recommended",
+        metavar="SOURCE_ID",
+        help="Compatibility mode: save the selected source's personal access token.",
+    )
     operation.add_argument("--tokenfactory", action="store_true")
     operation.add_argument("--reset", action="store_true")
     args = parser.parse_args(argv)
@@ -103,14 +131,6 @@ def main(argv: list[str] | None = None) -> int:
             check_health=not args.skip_tokenfactory_health_check,
             health_timeout=args.tokenfactory_health_timeout,
         )
-
-    if args.single:
-        try:
-            set_codex_model_provider(codex_config_path, "openai")
-        except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
-            print(f"switch failed: repairing model_provider failed: {exc}", file=sys.stderr)
-            return 1
-
     config_path = resolve_config_path(args.config)
     try:
         settings = load_settings(config_path)
@@ -119,14 +139,19 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     model = args.model or settings.model
 
-    if args.single or args.switch:
-        requested = args.single or args.switch
+    if args.single:
+        return _switch_to_single_account(
+            settings,
+            args.single,
+            codex_config_path=codex_config_path,
+            timeout=args.timeout,
+        )
+    if args.switch:
         return _switch_account(
             settings,
-            requested,
+            args.switch,
             model=model,
             timeout=args.timeout,
-            provider="openai" if args.single else None,
         )
 
     results = [_probe(source, model=model, timeout=args.timeout) for source in settings.sources]
@@ -199,14 +224,89 @@ def _check_tokenfactory_health(base_url: str, *, timeout: float) -> None:
         ) from exc
 
 
+def _switch_to_single_account(
+    settings: Settings,
+    requested: str,
+    *,
+    codex_config_path: Path,
+    timeout: float,
+) -> int:
+    source = _configured_source(settings, requested)
+    if source is None:
+        return 1
+    try:
+        reset_result = reset_codex_config(codex_config_path)
+    except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+        print(f"single-account switch failed: config reset failed: {exc}", file=sys.stderr)
+        return 1
+
+    codex_home = codex_config_path.expanduser().parent
+    env = _codex_env(codex_home)
+    try:
+        result = subprocess.run(
+            ["codex", "logout"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+            env=env,
+        )
+    except FileNotFoundError:
+        print(
+            "single-account switch failed: config was reset, but codex CLI was not found "
+            "to clear the saved login",
+            file=sys.stderr,
+        )
+        return 1
+    except subprocess.TimeoutExpired:
+        print(
+            "single-account switch failed: config was reset, but codex logout timed out",
+            file=sys.stderr,
+        )
+        return 1
+    if result.returncode != 0:
+        message = _safe_message(result.stderr or result.stdout)
+        print(
+            f"single-account switch failed: config was reset, but codex logout failed: {message}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Codex single-account mode is ready.")
+    print(f"Source: {source.source_id} ({source.label})")
+    print("Default provider: built-in OpenAI")
+    print("Saved shared login: cleared")
+    print(f"Config: {reset_result.config_path}")
+    if reset_result.backup_path is not None:
+        print(f"Backup: {reset_result.backup_path}")
+    print(
+        "Run codex, choose Sign in with ChatGPT, and authenticate the selected source "
+        "account to use its OAuth reset credit."
+    )
+    return 0
+
+
+def _configured_source(settings: Settings, requested: str) -> Source | None:
+    if requested == "recommended":
+        if settings.sources:
+            return settings.sources[0]
+        print("single-account switch failed: no enabled Codex source is configured", file=sys.stderr)
+        return None
+    source = next((item for item in settings.sources if item.source_id == requested), None)
+    if source is None:
+        print(f"single-account switch failed: unknown source_id {requested!r}", file=sys.stderr)
+    return source
+
+
 def _switch_account(
     settings: Settings,
     requested: str,
     *,
     model: str,
     timeout: float,
-    provider: str | None,
 ) -> int:
+    """Compatibility path for explicitly saving a personal access token."""
+
     source = _select_source(settings, requested, model=model, timeout=timeout)
     if source is None:
         return 1
@@ -233,16 +333,136 @@ def _switch_account(
     if result.returncode != 0:
         message = _safe_message(result.stderr or result.stdout, token)
         print(f"switch failed: codex login failed: {message}", file=sys.stderr)
-        if provider:
-            print(
-                "Codex config remains on the built-in openai provider so the CLI stays usable.",
-                file=sys.stderr,
-            )
         return 1
-    print(f"Switched local Codex account: {source.source_id} ({source.label})")
-    if provider:
-        print(f"Default provider: {provider}")
+    print(f"Switched saved access-token account: {source.source_id} ({source.label})")
+    print("This compatibility mode does not create a ChatGPT OAuth session.")
     return 0
+
+
+def _launch(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="codex-auth-switch launch",
+        description="Launch Codex with an isolated account cache and a private app server.",
+    )
+    parser.add_argument("--config", default=None, help="Account config JSON path.")
+    parser.add_argument("source_id")
+    parser.add_argument("codex_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+
+    config_path = resolve_config_path(args.config)
+    try:
+        settings = load_settings(config_path)
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    source = next((item for item in settings.sources if item.source_id == args.source_id), None)
+    if source is None:
+        print(f"launch failed: unknown source_id {args.source_id!r}", file=sys.stderr)
+        return 1
+
+    codex_home = _codex_home(source.source_id)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    try:
+        reset_codex_config(codex_home / "config.toml")
+    except (OSError, tomllib.TOMLDecodeError, ValueError) as exc:
+        print(f"launch failed: isolated config reset failed: {exc}", file=sys.stderr)
+        return 1
+    env = _codex_env(codex_home)
+    if not _ensure_chatgpt_oauth(source, env=env):
+        return 1
+
+    codex_args = list(args.codex_args)
+    if codex_args[:1] == ["--"]:
+        codex_args = codex_args[1:]
+    command = [
+        "codex",
+        "--no-daemon",
+        "-c",
+        FILE_CREDENTIALS_OVERRIDE,
+        *codex_args,
+    ]
+    try:
+        return subprocess.run(command, check=False, env=env).returncode
+    except FileNotFoundError:
+        print("launch failed: codex CLI was not found", file=sys.stderr)
+        return 1
+
+
+def _ensure_chatgpt_oauth(source: Source, *, env: dict[str, str]) -> bool:
+    auth_prefix = ["codex", "-c", FILE_CREDENTIALS_OVERRIDE]
+    status_command = [*auth_prefix, "login", "status"]
+    try:
+        status = subprocess.run(
+            status_command,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError:
+        print("launch failed: codex CLI was not found", file=sys.stderr)
+        return False
+
+    if _login_status_uses_chatgpt(status):
+        return True
+
+    if status.returncode == 0:
+        print(
+            f"Replacing the isolated non-OAuth login for {source.source_id} "
+            "with ChatGPT OAuth."
+        )
+        try:
+            logout = subprocess.run(
+                [*auth_prefix, "logout"],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+            )
+        except FileNotFoundError:
+            print("launch failed: codex CLI was not found", file=sys.stderr)
+            return False
+        if logout.returncode != 0:
+            message = _safe_message(logout.stderr or logout.stdout)
+            print(f"launch failed: could not remove the non-OAuth login: {message}", file=sys.stderr)
+            return False
+    else:
+        print(f"ChatGPT OAuth login required for {source.source_id} ({source.label}).")
+
+    print("Complete the browser sign-in using the matching ChatGPT account.")
+    try:
+        login = subprocess.run([*auth_prefix, "login"], check=False, env=env)
+    except FileNotFoundError:
+        print("launch failed: codex CLI was not found", file=sys.stderr)
+        return False
+    if login.returncode != 0:
+        print(f"launch failed: ChatGPT OAuth login exited with status {login.returncode}", file=sys.stderr)
+        return False
+
+    try:
+        verified = subprocess.run(
+            status_command,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError:
+        print("launch failed: codex CLI was not found", file=sys.stderr)
+        return False
+    if not _login_status_uses_chatgpt(verified):
+        message = _safe_message(verified.stderr or verified.stdout)
+        print(
+            "launch failed: login did not produce a ChatGPT OAuth session: " + message,
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _login_status_uses_chatgpt(result: subprocess.CompletedProcess[str]) -> bool:
+    message = f"{result.stdout or ''}\n{result.stderr or ''}".casefold()
+    return result.returncode == 0 and "logged in using chatgpt" in message
 
 
 def _select_source(
@@ -431,6 +651,20 @@ def _codex_home(source_id: str) -> Path:
         return root / "CodexAuthSwitch" / "codex-home" / safe_id
     root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
     return root / "codex-auth-switch" / "codex-home" / safe_id
+
+
+def _codex_env(codex_home: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(codex_home)
+    for name in AUTH_ENVIRONMENT_VARIABLES:
+        env.pop(name, None)
+    return env
+
+
+def _command_for_display(parts: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
 
 
 def _safe_message(value: str, secret: str | None = None) -> str:
