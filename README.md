@@ -1,8 +1,9 @@
 # codex-auth-switch
 
-Safely switch the local Codex CLI between saved ChatGPT access-token accounts,
-the built-in OpenAI provider, and a local TokenFactory gateway. The project is
-standalone and has no runtime Python dependencies.
+Safely switch the shared Codex CLI back to ChatGPT OAuth, launch isolated
+per-account OAuth sessions, switch to a local TokenFactory gateway, and recover
+a broken provider configuration. The project is standalone and has no runtime
+Python dependencies.
 
 ## Recovery first
 
@@ -55,11 +56,23 @@ account configs are detected as a backward-compatible fallback.
 # Probe configured accounts
 codex-auth-switch status
 
-# Repair provider first, then log into one account
+# Reset the shared CLI to built-in OpenAI and clear its saved login
 codex-auth-switch --single codex-personal
 
-# Probe and select the highest-priority available account
+# Then use plain Codex and complete ChatGPT OAuth in the browser
+codex
+
+# Or launch an OAuth account in its isolated CODEX_HOME
+codex-auth-switch launch codex-personal
+
+# Forward Codex arguments after --
+codex-auth-switch launch codex-personal -- -C C:\source\project
+
+# Reset shared Codex for the first configured account
 codex-auth-switch --single
+
+# Legacy only: save the source's 1Password access token in shared Codex
+codex-auth-switch --switch codex-personal
 
 # Define the provider and switch to the local gateway
 codex-auth-switch --tokenfactory
@@ -68,11 +81,31 @@ codex-auth-switch --tokenfactory
 codex-auth-switch --reset
 ```
 
-`--single` changes `model_provider` to the built-in `openai` provider before it
-invokes `codex login`. This ordering is deliberate: `codex login` loads
-`config.toml`, so an undefined provider would otherwise prevent the login from
-starting. If login later fails, the repaired `openai` selection remains in place
-so Codex stays launchable.
+`--single SOURCE_ID` is the shared-login workflow. It removes the TokenFactory
+provider override and the switcher's managed model-catalog override from
+`~/.codex/config.toml`, then runs `codex logout` against the shared Codex home.
+The next plain `codex` run therefore starts the normal **Sign in with ChatGPT**
+flow. Select the browser account that corresponds to `SOURCE_ID`; the source ID
+is a local label and cannot choose a browser account on your behalf.
+
+`launch SOURCE_ID` is the isolated-login workflow. It uses a separate
+`CODEX_HOME` for each source, resets any TokenFactory provider settings in that
+home, removes inherited API-key/access-token/workload-identity environment
+variables, and accepts the cached login only when `codex login status` reports
+ChatGPT. Otherwise it clears the isolated login and starts interactive ChatGPT
+OAuth before launching Codex. The launcher also uses file credential storage
+and `--no-daemon`, so it does not attach to an app server belonging to another
+login.
+
+`--switch SOURCE_ID` remains available only for compatibility. It reads the
+source's access token from 1Password and saves that token with `codex login
+--with-access-token`. It does **not** create a ChatGPT OAuth session and should
+not be used when you need OAuth-only account actions such as reset credit.
+
+Codex normally shares cached login details between local surfaces. Because
+`--single` intentionally logs out the shared home, an already-running terminal,
+desktop, or IDE session that uses those credentials can lose authorization.
+Use `launch SOURCE_ID` when other Codex sessions must remain alive.
 
 `--tokenfactory` never writes a dangling provider reference. It creates a
 complete `[model_providers.tokenfactory]` definition when one is missing, then
@@ -102,7 +135,9 @@ codex-auth-switch --tokenfactory --tokenfactory-url $url
 
 ## Security
 
-- Tokens are read from 1Password over stdin and are never placed in argv.
-- Probe errors redact the active token.
-- Per-account probe state is isolated under the platform user state directory.
+- Access tokens used by probes or legacy `--switch` are read from 1Password and
+  are never placed in argv; probe errors redact the active token.
+- Per-account OAuth credentials and probe state are isolated under the platform
+  user state directory.
+- Account launches use a private app server instead of the shared daemon.
 - `--reset` changes only `config.toml` and its local backup.
