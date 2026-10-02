@@ -50,7 +50,7 @@ def set_codex_model_provider(
             effective_url,
             replace_base_url=tokenfactory_url is not None,
         )
-        updated = _ensure_model_catalog_fallback(updated, path)
+        updated = _remove_managed_model_catalog(updated)
     else:
         updated = _remove_managed_model_catalog(updated)
     updated = _replace_top_level_model_provider(updated, provider)
@@ -214,48 +214,6 @@ def _resolve_tokenfactory_base_url(original: str, override: str | None) -> str:
             if isinstance(provider, dict) and isinstance(provider.get("base_url"), str):
                 return _normalize_tokenfactory_url(provider["base_url"])
     return TOKENFACTORY_PROVIDER_DEFAULTS["base_url"]
-
-
-def _ensure_model_catalog_fallback(original: str, config_path: Path) -> str:
-    """Use Codex's own cache when an older gateway cannot serve its catalog shape."""
-
-    lines = original.splitlines(keepends=True)
-    in_top_level = True
-    for line in lines:
-        if line.lstrip().startswith("["):
-            in_top_level = False
-        if in_top_level and _TOP_LEVEL_MODEL_CATALOG.match(line):
-            return original
-
-    catalog_path = config_path.parent / "models_cache.json"
-    if not _is_valid_model_catalog(catalog_path):
-        return original
-
-    newline = _newline_for(original)
-    insertion = [
-        f"{_MANAGED_MODEL_CATALOG_COMMENT}{newline}",
-        f"model_catalog_json = {_toml_string(str(catalog_path))}{newline}",
-    ]
-    table_index = next(
-        (index for index, line in enumerate(lines) if line.lstrip().startswith("[")),
-        len(lines),
-    )
-    if table_index and lines[table_index - 1].strip():
-        insertion.append(newline)
-    lines[table_index:table_index] = insertion
-    return "".join(lines)
-
-
-def _is_valid_model_catalog(path: Path) -> bool:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(payload, dict)
-        and isinstance(payload.get("models"), list)
-        and bool(payload["models"])
-    )
 
 
 def _remove_managed_model_catalog(original: str) -> str:

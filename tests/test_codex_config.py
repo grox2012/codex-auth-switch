@@ -106,7 +106,7 @@ def test_existing_tokenfactory_url_is_preserved_without_override(tmp_path) -> No
     )
 
 
-def test_tokenfactory_switch_uses_valid_codex_model_cache(tmp_path) -> None:
+def test_tokenfactory_switch_does_not_pin_model_catalog(tmp_path) -> None:
     path = tmp_path / "config.toml"
     path.write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
     (tmp_path / "models_cache.json").write_text(
@@ -117,7 +117,8 @@ def test_tokenfactory_switch_uses_valid_codex_model_cache(tmp_path) -> None:
     set_codex_model_provider(path, "tokenfactory")
 
     payload = tomllib.loads(path.read_text(encoding="utf-8"))
-    assert payload["model_catalog_json"] == str(tmp_path / "models_cache.json")
+    assert "model_catalog_json" not in payload
+    assert payload["model_provider"] == "tokenfactory"
 
 
 def test_tokenfactory_switch_preserves_user_model_catalog(tmp_path) -> None:
@@ -138,12 +139,12 @@ def test_tokenfactory_switch_preserves_user_model_catalog(tmp_path) -> None:
 
 def test_switching_to_openai_removes_only_managed_model_catalog(tmp_path) -> None:
     path = tmp_path / "config.toml"
-    path.write_text('model = "gpt-5.6-sol"\n', encoding="utf-8")
-    (tmp_path / "models_cache.json").write_text(
-        '{"models":[{"slug":"gpt-5.6-sol"}]}',
+    path.write_text(
+        'model = "gpt-5.6-sol"\n'
+        "# Managed by codex-auth-switch for TokenFactory.\n"
+        'model_catalog_json = "/pinned/models_cache.json"\n',
         encoding="utf-8",
     )
-    set_codex_model_provider(path, "tokenfactory")
 
     set_codex_model_provider(path, "openai")
 
@@ -152,13 +153,20 @@ def test_switching_to_openai_removes_only_managed_model_catalog(tmp_path) -> Non
     assert payload["model_provider"] == "openai"
 
 
-def test_invalid_codex_model_cache_is_not_configured(tmp_path) -> None:
+def test_tokenfactory_switch_removes_managed_model_catalog(tmp_path) -> None:
     path = tmp_path / "config.toml"
-    (tmp_path / "models_cache.json").write_text('{"object":"list"}', encoding="utf-8")
+    path.write_text(
+        'model = "gpt-5.6-sol"\n'
+        "# Managed by codex-auth-switch for TokenFactory.\n"
+        'model_catalog_json = "/pinned/models_cache.json"\n',
+        encoding="utf-8",
+    )
 
     set_codex_model_provider(path, "tokenfactory")
 
-    assert "model_catalog_json" not in tomllib.loads(path.read_text(encoding="utf-8"))
+    payload = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert "model_catalog_json" not in payload
+    assert payload["model_provider"] == "tokenfactory"
 
 
 def test_windows_crlf_config_remains_valid_when_url_is_replaced(tmp_path) -> None:

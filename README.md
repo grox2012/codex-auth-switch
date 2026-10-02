@@ -114,11 +114,12 @@ endpoint; an unreachable gateway leaves the current Codex provider unchanged.
 Use `--skip-tokenfactory-health-check` only when intentionally preparing an
 offline gateway.
 
-If `.codex/models_cache.json` contains a valid Codex model catalog, the switcher
-also references it through `model_catalog_json`. This keeps current Codex builds
-quiet when an older TokenFactory release returns only the OpenAI-style
-`/v1/models` shape. A user-supplied catalog setting is preserved; the managed
-fallback is removed when switching back to OpenAI or running `--reset`.
+The switcher never pins `model_catalog_json`. Codex maintains its own model
+catalog (bundled with the CLI and refreshed from its backend), while a pinned
+`models_cache.json` snapshot silently freezes the `/model` picker at whatever
+models existed when that snapshot was taken. Managed catalog pins written by
+older switcher versions are removed on every switch and by `--reset`; a
+catalog setting you wrote yourself is always preserved.
 
 Override the endpoint with `--tokenfactory-url` or `TOKENFACTORY_BASE_URL`.
 An explicit URL updates an existing provider definition instead of silently
